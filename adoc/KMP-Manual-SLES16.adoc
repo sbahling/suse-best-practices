@@ -623,86 +623,122 @@ https://github.com/openSUSE/pesign-obs-integration/blob/master/README[README].
 === Signing modules in an existing KMP
 
 Often the developer or packager does not have access to corporate signing keys
-and signing infrastructure. Those exist behind highly secure environemts and
+and signing infrastructure. Those exist behind highly secure environments and
 processes. Therefore the keys are not available at package build time and signing
 takes place as a secondary operation.
 
-The `pesign-obs-integration` package in {sles} provides a
-`modsign-repackage` utility that can be used to sign kernel modules in an
-existing KMP. `modsign-repackage` unpacks the original RPM, signs any included
-modules and re-creates the RPM. It also creates a second `<NAME>-ueficert RPM`
-that installs the certificate and calls the `mokutil` utility to enroll the
-public key. The re-packaged RPM will have a dependency on the `<NAME>-ueficert`
-RPM, ensuring that the certificates will be installed at the same time as the
-module(s).
+SUSE provides dedicated utilities for this workflow in the
+https://github.com/openSUSE/pesign-obs-integration[`pesign-obs-integration`] package:
 
-To repackage the
-`suse-hello-kmp-default-1.0_k6.12.0_160000.5-160000.7.1.x86_64.rpm` package with
-the key and the certificate created above, do the following:
+* `modsign-repackage`: Unpacks an existing KMP RPM, signs each included kernel module
+  (.ko) using a specified X.509 certificate and private key (or pre-generated detached
+  signatures), generates a companion `<NAME>-ueficert` RPM to enroll the public key via
+  `mokutil`, and rebuilds the RPM package.
+* `modsign-verify`: Validates the signature appended to the kernel modules against an
+  X.509 certificate or a certificate directory.
 
+[discrete]
+==== Step-by-step guide to resign and verify KMPs
+
+Partners can resign and verify KMPs with their own certificate and keys using the following steps:
+
+. *Install required packages*
++
+Partners must first install the `pesign-obs-integration` package along with the necessary build utilities (`rpm-build` and `kernel-source`):
++
 [source, bash]
 ----
-$ modsign-repackage -c ./cert.der -k ./key.asc ./suse-hello-kmp-default-1.0_k6.12.0_160000.5-160000.7.11.0_k4.4.73_5-0.x86_64.rpm
+# zypper install pesign-obs-integration rpm-build kernel-source
+----
++
+[NOTE]
+.Required dependencies
+====
+`modsign-repackage` requires `/usr/bin/rpmbuild` (provided by the `rpm-build` package) and `/usr/lib/rpm/kernel-cert-subpackage` (provided by the `kernel-source` package).
+====
+
+. *Prepare your key and certificate*
++
+Ensure that you have your X.509 certificate in DER format (`cert.der`) and the matching private key (`key.asc` or `signing_key.priv`):
++
+[source, bash]
+----
+# Convert a PEM certificate to DER format if needed:
+$ openssl x509 -in cert.pem -outform DER -out cert.der
 ----
 
-The above command creates the following directories and files in the current
-working directory:
-
+. *Resign and repackage the KMP*
++
+Run `modsign-repackage` on the KMP, passing your DER certificate (`-c`), private key (`-k`), and the target KMP RPM file:
++
+[source, bash]
+----
+$ modsign-repackage -c ./cert.der -k ./key.asc ./suse-hello-kmp-default-1.0_k6.12.0_160000.5-160000.7.1.x86_64.rpm
+----
++
+The command unpacks the original RPM, signs any included modules, and creates new RPMs in the `./RPMS/<architecture>/` directory:
++
 ----
 ./RPMS/
    x86_64/
-     suse-hello-kmp-default-1.0_k6.12.0_160000.5-160000.7.11.0_k4.4.73_5-0.x86_64.rpm
+     suse-hello-kmp-default-1.0_k6.12.0_160000.5-160000.7.1.x86_64.rpm
      suse-hello-ueficert-1.0-0.x86_64.rpm
 ----
++
+The generated `<NAME>-ueficert` RPM installs the public certificate and configures `mokutil` so the public key is enrolled on the target system when the package is installed.
 
-To see the module signature, unpack the repackaged Kernel Module Package and use the `modinfo`
-command to view the module signature info:
+. *Verify module signatures with `modsign-verify`*
++
+After repackaging is complete, verify that the kernel modules inside the newly created package are properly signed with the desired key:
++
+a. Extract the newly repackaged RPM to a temporary directory:
++
+[source, bash]
 ----
-rpm2cpio suse-hello-kmp-default-1.0_k6.12.0_160000.5-160000.7.11.0_k4.4.73_5-0.x86_64.rpm | cpio -idv
-modinfo ./usr/lib/modules/6.12.0-160000.5-default/updates/hello.ko | grep signature
+$ mkdir /tmp/verify-kmp && cd /tmp/verify-kmp
+$ rpm2cpio /path/to/RPMS/x86_64/suse-hello-kmp-default-1.0_k6.12.0_160000.5-160000.7.1.x86_64.rpm | cpio -idmv
+----
++
+b. Run `modsign-verify` against the extracted `.ko` module, specifying the certificate:
++
+[source, bash]
+----
+$ modsign-verify --certificate /path/to/cert.der ./usr/lib/modules/6.12.0-160000.5-default/updates/hello.ko
+----
++
+On a valid signature, the tool confirms:
++
+----
+./usr/lib/modules/6.12.0-160000.5-default/updates/hello.ko: good signature
+----
++
+You can also verify against all certificates in a directory (defaulting to `/etc/uefi/certs`):
++
+[source, bash]
+----
+$ modsign-verify --cert-dir /etc/uefi/certs ./usr/lib/modules/6.12.0-160000.5-default/updates/hello.ko
+----
++
+Alternatively, use `modinfo` to inspect the embedded signature details:
++
+[source, bash]
+----
+$ modinfo ./usr/lib/modules/6.12.0-160000.5-default/updates/hello.ko | grep signature
 ----
 
-[NOTE]
-.rpmbuild must be installed
+. *Resign the RPM package itself*
++
+[IMPORTANT]
+.Module signatures vs. package signatures
 ====
-modsign-repackage requires the /usr/bin/rpmbuild utility which is provided by the
-rpmbuild package.
+`modsign-repackage` signs the kernel module files (`.ko`) inside the package, but during the process any existing RPM package-level signature is stripped.
+To ensure package integrity and allow package managers to verify the package origin, re-sign the entire RPM file:
 ====
-
-After the process is complete, you can use `modsign-verify` to confirm that the
-modules inside the new package are correctly signed with the new key.
-
-[discrete]
-==== Module signatures vs. package signatures
-
-It is crucial to distinguish between two different types of signatures:
-
-* Module signature: The signature on the kernel module files (.ko) inside the
-  package. This is what `modsign-repackage` and `modsign-verify` manage.
-* Package signature: The signature on the KMP file itself (for example, an `rpm` or `deb`
-  package signature) that verifies the package's integrity.
-
-The `modsign-repackage` tool only signs the modules. During this process, any
-existing package-level signature is removed. This means you will almost always
-need to re-sign the entire package file after running the tool.
-
-[discrete]
-==== Resigning workflow
-
-Follow these steps to properly resign the kernel modules within a KMP:
-
-. Prepare the KMP files that contain the kernel modules you need to resign.
-. Resign Modules: Run the `modsign-repackage` command on the KMP using the
-  desired signing keys. This creates a new, repackaged KMP file where all kernel
-  modules inside are signed with the new key.
-. Verify Modules: Run `modsign-verify` on the newly created KMP file. This
-  utility checks the signatures of the .ko modules inside the package to
-  confirm they are valid.
-. Resign the Package: Since `modsign-repackage` removed the
-  original package-level signature (from step 3), the new KMP file itself is
-  now unsigned. You should re-sign the entire package file (for example, using `rpmsig`
-  for an RPM) to ensure package integrity and allow package managers to verify
-  it.
++
+[source, bash]
+----
+$ rpm --addsign ./RPMS/x86_64/*.rpm
+----
 
 === Installing secure-boot-enabled KMPs
 
